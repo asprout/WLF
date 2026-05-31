@@ -171,16 +171,15 @@ def compute_div_v_hutchinson(velocity_fn, t, x, rng):
 
 
 def get_loss(config, model_s, model_q, time_sampler, train):
-  if _helmholtz_flag(config) and config.loss != 'rf':
+  if _helmholtz_flag(config) and config.loss not in ('rf', 'hybrid_am_helm'):
     raise NotImplementedError(
-      f"config.model_s.helmholtz=True is currently only supported with "
-      f"config.loss='rf' (rectified flow / flow matching), where v is "
-      f"supervised directly and the Helmholtz parameterisation v=∇U+c is "
-      f"used as-is in ‖v - target‖². Got config.loss={config.loss!r}, "
-      f"whose action-matching style derivation assumes v=∇S; adding a "
-      f"non-gradient curl breaks the HJB identification and the loss is "
-      f"no longer well-posed. Switch to config.loss='rf' or set "
-      f"config.model_s.helmholtz=False."
+      f"config.model_s.helmholtz=True is supported with config.loss in "
+      f"('rf', 'hybrid_am_helm'). Got config.loss={config.loss!r}. AM-"
+      f"family losses (am/sb/ubot/ubot+/phot) require v=∇S for their HJB "
+      f"derivation; adding a non-gradient curl breaks the identification. "
+      f"To use Helmholtz on a non-RF host, use 'hybrid_am_helm': it trains "
+      f"U via AM's action term and c via an RF-style chord-matching term, "
+      f"composing the two with `train.lambda_match`."
     )
   if config.loss == 'am':
     return get_loss_ours(config, model_s, model_q, time_sampler, train)
@@ -194,6 +193,10 @@ def get_loss(config, model_s, model_q, time_sampler, train):
     return get_loss_ours(config, model_s, model_q, time_sampler, train)
   elif config.loss == 'rf':
     return get_loss_rf(config, model_s, model_q, time_sampler, train)
+  elif config.loss == 'hybrid_am_helm':
+    return get_loss_hybrid_am_helmholtz(
+      config, model_s, model_q, time_sampler, train,
+    )
   else:
     NotImplementedError(f'config.loss: {config.loss} is not implemented')
 
@@ -489,6 +492,268 @@ def get_loss_rf(config, model_s, model_q, time_sampler, train):
 
 def _is_helmholtz_config(config) -> bool:
   return bool(getattr(config.model_s, "helmholtz", False))
+
+
+# ---------------------------------------------------------------------------
+# Hybrid AM-Helmholtz loss
+#
+# The motivation, recapped (per the implementation-plan discussion):
+#
+#   - WLF's action-matching losses (am/sb/ubot/ubot+/phot) bake in
+#     v = ∇S — the HJB derivation identifies the velocity with the
+#     gradient of the scalar action. Substituting v = ∇U + c into the
+#     kinetic term destroys the identification: ∂L/∂c = E[v] = 0, which
+#     drives the average velocity to zero (silently wrong).
+#
+#   - Rectified flow (RF) doesn't have this issue (the loss is just
+#     ``mean(‖v − target‖²)`` with no HJB structure), so 'rf'+Helmholtz is
+#     mathematically clean and was the original Helmholtz host.
+#
+#   - On Walchli, RF turned out to be a much weaker baseline than AM
+#     (init_final_corr 0.36–0.50 vs 0.92–0.95 for am_otcouple). So
+#     Helmholtz-on-RF can't be cleanly evaluated: the host model is broken.
+#
+# The Hybrid AM-Helmholtz approach gets around this by COMPOSING two
+# losses with different targets:
+#
+#   1. AM's HJB loss on U alone — preserves the action structure on the
+#      scalar potential. U trains as it would under pure AM.
+#   2. An RF-style chord-matching term on v = ∇U + c — supervises c via
+#      the same flow-matching objective Helmholtz was clean for on RF.
+#
+#       L = L_AM(U) + λ_match · L_FM(v = ∇U + c)
+#
+# Interpretation: U is the action (cells flow downhill); c is the residual
+# vector field needed to match the marginal transport that U alone can't.
+# If U is sufficient (the data's transport is gradient-only), λ_c at any
+# positive value drives c to zero and the model behaves as pure AM. If U
+# is insufficient (barycentric-field failure), c picks up the residual.
+#
+# Online references:
+#   * Neklyudov et al. ICML 2024 (WLF) for the AM derivation.
+#   * Lipman et al. 2023 (arXiv:2210.02747) for the parameterisation-
+#     agnostic flow-matching loss used as L_FM.
+#   * Tong et al. 2023 (OT-CFM, arXiv:2302.00482) for the consecutive-pair
+#     bin-couple chord-matching pattern, which we mirror for L_FM.
+# ---------------------------------------------------------------------------
+def get_potential_fn(model_s, params_s, train):
+  """Return a callable ``U(t, x, rng=None) -> (B, 1)`` for the SCALAR
+  potential head.
+
+  Symmetric counterpart to :func:`get_velocity_fn`:
+    - For a HelmholtzModelPair, calls ``.apply_potential`` which returns
+      U (scalar) without invoking the curl head.
+    - For a non-Helmholtz scalar model, the model itself IS the potential
+      (its ``.apply`` returns scalar) — so we use ``get_model_fn``
+      directly.
+
+  The hybrid AM-Helmholtz loss uses this for the AM/HJB term: AM's
+  derivation only needs U, not v, so we route the AM math through the
+  scalar potential head exclusively.
+  """
+  if _is_helmholtz(model_s):
+    # HelmholtzModelPair-specific accessor that wraps .apply_potential the
+    # same way mutils.get_model_fn wraps .apply.
+    def u_fn(t, x, rng=None):
+      variables = dict(params=params_s)
+      if not train:
+        return model_s.apply_potential(
+          variables, t, x, train=False, mutable=False,
+        )
+      rngs = {'dropout': rng}
+      return model_s.apply_potential(
+        variables, t, x, train=True, mutable=False, rngs=rngs,
+      )
+    return u_fn
+  # Non-Helmholtz: ``model_s`` IS the scalar potential.
+  return mutils.get_model_fn(model_s, params_s, train=train)
+
+
+def get_loss_hybrid_am_helmholtz(
+  config, model_s, model_q, time_sampler, train,
+):
+  """Hybrid AM-Helmholtz loss factory: AM on U + λ_match · FM on (∇U + c).
+
+  Requires ``config.model_s.helmholtz = True`` (the curl head needs to
+  exist to be trained). Adds three knobs on top of the WLF AM defaults:
+
+  * ``config.train.lambda_match`` (float, default 1.0) — relative weight of
+    the FM chord-matching term that supervises ``v = ∇U + c``. At
+    λ_match=0 the curl head receives no gradient signal and decays to zero
+    under ``λ_c > 0``, recovering pure AM. At λ_match=1.0 the two terms
+    contribute comparably; higher values prioritise marginal matching
+    (the c head gets stronger updates relative to the action structure on U).
+
+  * ``config.train.sink_weight`` — same potency-sink term as the other
+    losses; evaluated on observed cells using the full Helmholtz velocity.
+
+  * ``config.train.lambda_div`` / ``lambda_c`` — curl-head regularizers.
+
+  Structurally mirrors :func:`get_loss_ours` for the AM part (the
+  ``potential`` closure → bridge q → boundary + time-integral) and
+  :func:`get_loss_rf` for the FM part (consecutive-bin chord matching).
+  """
+  if not _is_helmholtz_config(config):
+    raise ValueError(
+      "loss='hybrid_am_helm' requires config.model_s.helmholtz=True (the "
+      "curl head must exist to be trained)."
+    )
+
+  lambda_match = float(getattr(config.train, "lambda_match", 1.0))
+  sink_weight = float(getattr(config.train, "sink_weight", 0.0))
+  lambda_div = float(getattr(config.train, "lambda_div", 0.0))
+  lambda_c = float(getattr(config.train, "lambda_c", 0.0))
+  div_estimator = str(getattr(config.train, "div_estimator", "hutchinson"))
+
+  # AM term operates on U (scalar potential). Its ``potential`` closure is
+  # the standard AM Lagrangian density: dU/dt + 0.5·‖∇U‖² (the kinetic
+  # half-energy on the gradient flow ∇U, NOT on the full Helmholtz v).
+  # Critically: c is NOT in this closure. AM trains U as if it were a
+  # gradient-only model. The c head is supervised separately by L_FM.
+  def potential_U(_t, _x, _key, _u):
+    dudtdx_fn = jax.grad(
+      lambda __t, __x, __key: _u(__t, __x, __key).sum(), argnums=[0, 1],
+    )
+    dudt, dudx = dudtdx_fn(_t, _x, _key)
+    return dudt + 0.5 * (dudx ** 2).sum(1, keepdims=True)
+
+  def loss_fn(key, params_s, params_q, sampler_state, batch):
+    if len(batch) == 3:
+      timesteps, x, weights = batch
+    else:
+      timesteps, x = batch
+      weights = None
+    bs = x.shape[0]
+
+    keys = random.split(key, num=14)
+    u_fn = get_potential_fn(model_s, params_s, train=train)
+    v_fn = mutils.get_model_fn(model_s, params_s, train=train)  # Helmholtz pair → velocity
+    q = mutils.get_model_fn(model_q, params_q, train=train)
+
+    # ----- AM term on U (mirrors get_loss_ours['am']) -----
+    acceleration_fn = jax.grad(
+      lambda _t, _x, _key: potential_U(_t, _x, _key, u_fn).sum(), argnums=1,
+    )
+    t_0, t_1 = timesteps[:, 0, :], timesteps[:, -1, :]
+    t, next_sampler_state = time_sampler.sample_t(bs, sampler_state)
+    t = t.reshape(-1, 1)
+
+    # Bridge q samples + AM inner-loop refinement (verbatim from
+    # get_loss_ours so the AM term's training dynamics match upstream).
+    samples_q = q(t, batch, keys[0])
+    x_t = jax.lax.stop_gradient(samples_q)
+    mask = (t >= timesteps[:, :-1, 0]) * (t <= timesteps[:, 1:, 0])
+    t_mult = config.train.step_size * (
+      (1.0 - ((t - timesteps[:, :-1, 0]) /
+              (timesteps[:, 1:, 0] - timesteps[:, :-1, 0])) ** 2 * mask
+       - ((timesteps[:, 1:, 0] - t) /
+          (timesteps[:, 1:, 0] - timesteps[:, :-1, 0])) ** 2 * mask) * mask
+    ).sum(1, keepdims=True)
+    for i in range(config.train.n_gradient_steps):
+      dx = jax.lax.stop_gradient(
+        acceleration_fn(t, x_t, jax.random.fold_in(keys[1], i)),
+      )
+      x_t = x_t + t_mult * jnp.clip(dx, -1, 1)
+
+    # AM boundary + time-integral.
+    x0_b, x1_b = x[:, 0, :], x[:, -1, :]
+    u_0 = u_fn(t_0, x0_b, keys[2])
+    u_1 = u_fn(t_1, x1_b, keys[3])
+    loss_AM = u_0.reshape((-1, 1)) - u_1.reshape((-1, 1))
+    pot_value = potential_U(t, x_t, keys[4], u_fn)
+    loss_AM = loss_AM + pot_value
+    metrics = {'loss_AM': loss_AM.mean()}
+    total_loss = loss_AM.mean()
+
+    # ----- FM term on v = ∇U + c (mirrors get_loss_rf chord matching) -----
+    # Use the SAME sampled t and reuse x_t? NO — RF needs a clean linear
+    # interpolant between consecutive bins, not the bridge-refined point.
+    # Sample a new (consecutive bin pair, t, x_fm) using RF's interpolant
+    # logic.
+    t_right = (timesteps < t.reshape(-1, 1, 1)).sum(1)
+    t_right = jnp.fmax(t_right, jnp.ones_like(t_right).astype(int))
+    t_left = t_right - 1
+    x_left = x[jnp.arange(len(x)), t_left.ravel(), :]
+    x_right = x[jnp.arange(len(x)), t_right.ravel(), :]
+    t_0_pair = timesteps[jnp.arange(len(x)), t_left.ravel(), :]
+    t_1_pair = timesteps[jnp.arange(len(x)), t_right.ravel(), :]
+    x_t_fm = (
+      (t_1_pair - t) / (t_1_pair - t_0_pair) * x_left
+      + (t - t_0_pair) / (t_1_pair - t_0_pair) * x_right
+    )
+    dxtdt = (x_right - x_left) / (t_1_pair - t_0_pair)
+
+    v_at_xt = v_fn(t, x_t_fm, keys[5])   # Helmholtz pair → v = ∇U + c
+    loss_FM = ((v_at_xt - dxtdt) ** 2).sum(-1, keepdims=True).mean()
+    metrics['loss_FM'] = loss_FM
+    total_loss = total_loss + lambda_match * loss_FM
+
+    # ----- Sink supervision (loss-agnostic helper) -----
+    if sink_weight > 0 and weights is not None:
+      loss_sink, sink_diag = compute_sink_loss(
+        v_fn, timesteps, x, weights, sink_weight, keys[6],
+      )
+      total_loss = total_loss + loss_sink
+      metrics.update(sink_diag)
+
+    # ----- Divergence regulariser on c (Hutchinson) -----
+    if lambda_div > 0:
+      def _c_call(t_, x_, rng_):
+        rngs = {"dropout": rng_} if train else None
+        return model_s.apply_curl(
+          {"params": params_s}, t_, x_,
+          train=train, mutable=False, rngs=rngs,
+        )
+
+      def _div_hutch(rng_):
+        eps = random.normal(rng_, x_t_fm.shape)
+        _, jvp = jax.jvp(lambda _x: _c_call(t, _x, rng_), (x_t_fm,), (eps,))
+        return (jvp * eps).sum(-1)
+
+      if div_estimator == "decoupled":
+        d1 = _div_hutch(keys[7])
+        d2 = _div_hutch(keys[8])
+        div_sq = d1 * d2
+      else:
+        d_one = _div_hutch(keys[7])
+        div_sq = d_one ** 2
+
+      loss_div = lambda_div * div_sq.mean()
+      total_loss = total_loss + loss_div
+      metrics['loss_div'] = loss_div
+      metrics['div_c_rms'] = jnp.sqrt(jnp.clip(div_sq.mean(), 1e-12))
+
+    # ----- Curl-magnitude L2 -----
+    if lambda_c > 0:
+      rngs_c = {"dropout": keys[9]} if train else None
+      c_at_xt = model_s.apply_curl(
+        {"params": params_s}, t, x_t_fm,
+        train=train, mutable=False, rngs=rngs_c,
+      )
+      norm_c_sq = (c_at_xt ** 2).sum(-1)
+      loss_c_norm = lambda_c * norm_c_sq.mean()
+      total_loss = total_loss + loss_c_norm
+      metrics['loss_c_norm'] = loss_c_norm
+      metrics['c_norm_rms'] = jnp.sqrt(jnp.clip(norm_c_sq.mean(), 1e-12))
+
+    # ----- Bridge q's adversarial loss (verbatim from AM) -----
+    # The bridge is trained against U only, NOT v=∇U+c — keeping the q
+    # objective aligned with the action structure that defined it.
+    u_detached = get_potential_fn(
+      model_s, jax.lax.stop_gradient(params_s), train=train,
+    )
+    loss_q = -potential_U(t, samples_q, keys[10], u_detached)
+    metrics['loss_q'] = loss_q.mean()
+    total_loss = total_loss + loss_q.mean()
+
+    # Acceleration diagnostic (matches AM's) — measures the gradient of
+    # the AM potential closure on the bridge samples.
+    metrics['acceleration'] = jnp.linalg.norm(
+      acceleration_fn(t, samples_q, keys[11]), axis=1,
+    ).mean()
+    return total_loss, (next_sampler_state, metrics)
+
+  return loss_fn
 
 import datasets
 import numpy as np
