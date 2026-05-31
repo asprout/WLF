@@ -14,21 +14,26 @@ from models import utils as mutils
 
 
 def get_generator(model, config):
-  
+
   def grad_vf(t,y,state):
-    s = mutils.get_model_fn(model, 
-                            state.params_ema if config.eval.use_ema else state.model_params, 
+    s = mutils.get_model_fn(model,
+                            state.params_ema if config.eval.use_ema else state.model_params,
                             train=False)
     dsdx = jax.grad(lambda _t, _x: s(_t*jnp.ones((_x.shape[0],1)), _x).sum(), argnums=1)
     return dsdx(t,y)
-  
+
   def vf(t,y,state):
-    s = mutils.get_model_fn(model, 
-                            state.params_ema if config.eval.use_ema else state.model_params, 
+    s = mutils.get_model_fn(model,
+                            state.params_ema if config.eval.use_ema else state.model_params,
                             train=False)
     return s(t*jnp.ones((y.shape[0],1)), y)
-  
-  if config.loss == 'rf':
+
+  # Both 'rf' (vector-output model_s) AND helmholtz mode (HelmholtzModelPair
+  # whose .apply already returns velocity) use the direct-output ``vf`` path.
+  # The scalar-potential grad path (``grad_vf``) only applies to the original
+  # action-style losses (am/sb/ubot/ubot+/phot) at config.helmholtz=False.
+  is_helmholtz = isinstance(model, mutils.HelmholtzModelPair)
+  if config.loss == 'rf' or is_helmholtz:
     vector_field = vf
   else:
     vector_field = grad_vf

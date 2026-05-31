@@ -107,6 +107,68 @@ class MLP(nn.Module):
     return h
 
   
+@utils.register_model(name='mlp_curl')
+class MlpCurl(nn.Module):
+  """Vector-field MLP for the **curl** component of a Helmholtz-decomposed
+  velocity field ``v = ∇U + c`` (lfvae extension).
+
+  Shape mirrors ``mlp_vf`` (vector output, dim = ``config.input_dim``); the
+  **only** difference is that the final ``Dense`` layer is initialised to
+  zero. This is the key inductive bias: at step 0 we have ``c(t, x) ≡ 0``
+  identically, so the Helmholtz velocity coincides exactly with the pure-
+  gradient baseline ``∇U`` at initialisation. The curl head only diverges
+  from zero if the loss explicitly rewards non-gradient structure (marginal
+  matching that gradient flow cannot reproduce — closed orbits, cell cycle,
+  etc.). Without zero-init the curl would inject random noise into the
+  velocity from epoch 0 and obscure the Phase-1 "Helmholtz matches gradient
+  baseline at step 0" sanity check.
+
+  Reference: the residual-block "initialize last layer to zero" trick from
+  GANs / score-based diffusion (Karras et al. 2022, Ho & Salimans 2022). The
+  argument is identical here: the model starts behaving as the simpler
+  parameterisation and learns the extra component only when supervised.
+
+  NOTE on sign convention: wl-mechanics throughout uses the **action**
+  convention where velocity is the *positive* gradient of the scalar S
+  (cf. ``eval_utils.grad_vf`` returning ``+dsdx``). So Helmholtz here is
+  ``v = +∇U + c``. To recover the spec's energy-landscape interpretation
+  (cells flow downhill on energy ``E``), take ``E = −U`` and the same
+  ``c``: ``v = −∇E + c``. Attractor analysis on ``E`` (Stage 4) follows
+  the spec's sign convention by negating ``U`` post-training.
+  """
+  config: ml_collections.ConfigDict
+
+  @nn.compact
+  def __call__(self, t: jnp.ndarray, x: jnp.ndarray, train: bool):
+    config = self.config
+    act = get_act(config)
+    nf = config.nf
+
+    if config.embed_time:
+      temb = t
+      temb = nn.Dense(nf)(temb)
+      temb = nn.Dense(nf)(act(temb))
+      h = x
+    else:
+      h = jnp.hstack([x, t])
+
+    h = act(nn.Dense(nf)(h))
+    for _ in range(config.n_layers):
+      if config.embed_time:
+        h += temb
+      h = nn.Dropout(config.dropout)(h, deterministic=not train)
+      if config.skip:
+        h = act(nn.Dense(nf)(h)) + h
+      else:
+        h = act(nn.Dense(nf)(h))
+    h = act(nn.Dense(nf)(h))
+    # Zero-init both kernel and bias — c ≡ 0 at step 0 (see class docstring).
+    h = nn.Dense(config.input_dim,
+                 kernel_init=nn.initializers.zeros,
+                 bias_init=nn.initializers.zeros)(h)
+    return h
+
+
 @utils.register_model(name='mlp_q')
 class MLP(nn.Module):
   config: ml_collections.ConfigDict
@@ -116,7 +178,7 @@ class MLP(nn.Module):
     config = self.config
     act = get_act(config)
     nf = config.nf
-    
+
     timesteps, x = batch
     # timesteps.shape = (batch_size, n_marginals, 1)
     # x.shape = (batch_size, n_marginals, dim)
