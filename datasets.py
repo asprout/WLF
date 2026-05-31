@@ -121,32 +121,41 @@ def get_batch_iterator(config, init_key, eval=False, val=False):
     else:
       return test_iterator, inv_scaler
     
-  # Precompute jnp views of weights if active. Each W_train[i] must have
-  # shape (n_i,) or (n_i, 1) aligned with X_train[i]. We standardise to
-  # (n_i, 1) for clean indexing alongside x.
+  # Pre-convert X_train AND (if present) W_train to jnp arrays BEFORE the
+  # @jax.jit'd iterator body. The original upstream iterator could get away
+  # with numpy X_train because it used the population-array form
+  # ``jax.random.choice(key, X_train[i], (B,))`` which dispatches the
+  # numpy→jax conversion internally. We need to gather indices SEPARATELY so
+  # the same indices can index both x and w (sink alignment), and that
+  # ``X_train[i][ids]`` pattern requires X_train[i] to already be a jnp
+  # array — otherwise a numpy.__array__() call on a traced index fires at
+  # jit-trace time. (Bug fix: previously crashed every linear-interpolant
+  # variant with ``TracerArrayConversionError``.)
+  X_train_jnp = [jnp.asarray(np.asarray(arr, dtype=np.float32))
+                 for arr in X_train]
   if yield_weights:
     W_jnp = []
     for i, w in enumerate(W_train):
       w_arr = np.asarray(w, dtype=np.float32).reshape(-1, 1)
-      if w_arr.shape[0] != X_train[i].shape[0]:
+      if w_arr.shape[0] != X_train_jnp[i].shape[0]:
         raise ValueError(
           f"W_train[{i}] length {w_arr.shape[0]} != X_train[{i}] length "
-          f"{X_train[i].shape[0]}; weights must align cell-for-cell.")
+          f"{X_train_jnp[i].shape[0]}; weights must align cell-for-cell.")
       W_jnp.append(jnp.asarray(w_arr))
 
   @jax.jit
   def linear_train_iterator(key):
-    keys = jax.random.split(key, len(X_train))
-    x_batch = jnp.zeros((batch_size, len(X_train), config.data.dim))
-    t_batch = jnp.zeros((batch_size, len(X_train), 1))
+    keys = jax.random.split(key, len(X_train_jnp))
+    x_batch = jnp.zeros((batch_size, len(X_train_jnp), config.data.dim))
+    t_batch = jnp.zeros((batch_size, len(X_train_jnp), 1))
     if yield_weights:
-      w_batch = jnp.zeros((batch_size, len(X_train), 1))
-    for i in range(len(X_train)):
+      w_batch = jnp.zeros((batch_size, len(X_train_jnp), 1))
+    for i in range(len(X_train_jnp)):
       # Sample cell indices once, use the same indices to gather both x and w
       # so weights stay aligned with the cells they belong to.
       ids = jax.random.choice(
-        keys[i], X_train[i].shape[0], (batch_size,), replace=True)
-      x_batch = x_batch.at[:, i, :].set(X_train[i][ids])
+        keys[i], X_train_jnp[i].shape[0], (batch_size,), replace=True)
+      x_batch = x_batch.at[:, i, :].set(X_train_jnp[i][ids])
       t_batch = t_batch.at[:, i, :].set(t[i])
       if yield_weights:
         w_batch = w_batch.at[:, i, :].set(W_jnp[i][ids])
