@@ -180,18 +180,13 @@ def get_batch_iterator(config, init_key, eval=False, val=False):
 
   if config.interpolant == 'linear':
     return linear_train_iterator, inv_scaler
-  
-  # ot_train_iterator does NOT support sink supervision: the categorical-
-  # sampling from the joint plan re-shuffles cell identities across the
-  # consecutive pair, so per-cell weights would no longer align with the
-  # cells they were derived from. Warn loudly if the caller asked for both.
-  if yield_weights and config.interpolant in ('ot', 'diffusion', 'geodesic'):
-    print(
-      "[datasets] WARNING: sink_weight > 0 with interpolant='%s' is not "
-      "supported; sink supervision will be DISABLED. Use "
-      "interpolant='linear' to enable sink supervision." % config.interpolant,
-      flush=True)
-    yield_weights = False
+
+  # ot_train_iterator now supports sink supervision: each per-marginal
+  # categorical sample produces row indices into X_train[i] (and into
+  # W_train[i] via the same indices), so the per-cell weight stays attached
+  # to the cell it was derived from. The plan only determines WHICH cells
+  # get jointly sampled — the within-marginal index → weight mapping is
+  # unchanged from the linear path.
 
   if config.interpolant in ('diffusion', 'geodesic'):
     # Manifold-aware coupling: use the precomputed plan chain (set via
@@ -224,12 +219,26 @@ def get_batch_iterator(config, init_key, eval=False, val=False):
     
   for i in range(len(X_train)):
     X_train[i] = jnp.array(X_train[i])
-  
+
+  # Same weights conversion as the linear path (pre-converted so traced
+  # indexing inside @jax.jit works); used when yield_weights is active.
+  if yield_weights:
+    W_jnp_ot = []
+    for i, w in enumerate(W_train):
+      w_arr = np.asarray(w, dtype=np.float32).reshape(-1, 1)
+      if w_arr.shape[0] != X_train[i].shape[0]:
+        raise ValueError(
+          f"W_train[{i}] length {w_arr.shape[0]} != X_train[{i}] length "
+          f"{X_train[i].shape[0]}; weights must align cell-for-cell.")
+      W_jnp_ot.append(jnp.asarray(w_arr))
+
   @jax.jit
   def ot_train_iterator(key):
     keys = jax.random.split(key, len(X_train))
     x_batch = jnp.zeros((batch_size, len(X_train), config.data.dim))
     t_batch = jnp.zeros((batch_size, len(X_train), 1))
+    if yield_weights:
+      w_batch = jnp.zeros((batch_size, len(X_train), 1))
     for i in range(len(X_train)):
       if i == 0:
         ids = jax.random.categorical(keys[i], np.zeros((X_train[0].shape[0],)), shape=(batch_size,))
@@ -237,19 +246,29 @@ def get_batch_iterator(config, init_key, eval=False, val=False):
         ids = jax.random.categorical(keys[i], log_plans[i-1][ids], axis=1, shape=(batch_size,))
       x_batch = x_batch.at[:,i,:].set(X_train[i][ids])
       t_batch = t_batch.at[:,i,:].set(t[i])
-    
+      if yield_weights:
+        # Same indices as x → the gathered weight stays attached to its cell.
+        w_batch = w_batch.at[:, i, :].set(W_jnp_ot[i][ids])
+
     x_batch = x_batch.reshape(jax.local_device_count(),
-                              config.train.n_jitted_steps, 
+                              config.train.n_jitted_steps,
                               batch_size//jax.local_device_count(),
                               len(X_train),
                               config.data.dim)
     t_batch = t_batch.reshape(jax.local_device_count(),
-                              config.train.n_jitted_steps, 
+                              config.train.n_jitted_steps,
                               batch_size//jax.local_device_count(),
                               len(t),
                               1)
+    if yield_weights:
+      w_batch = w_batch.reshape(jax.local_device_count(),
+                                config.train.n_jitted_steps,
+                                batch_size // jax.local_device_count(),
+                                len(t),
+                                1)
+      return (t_batch, x_batch, w_batch)
     return (t_batch, x_batch)
-  
+
   if config.interpolant in ('ot', 'diffusion', 'geodesic'):
     return ot_train_iterator, inv_scaler
 
