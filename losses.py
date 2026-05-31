@@ -264,14 +264,20 @@ def get_loss_ours(config, model_s, model_q, time_sampler, train):
 
     ################################################# loss s #################################################
     acceleration_fn = jax.grad(lambda _t, _x, _key: potential(_t, _x, _key, s).sum(), argnums=1)
-    
+
     # sample time
     t_0, t_1 = timesteps[:,0,:], timesteps[:,-1,:]
     t, next_sampler_state = time_sampler.sample_t(bs, sampler_state)
     t = t.reshape(-1,1)
 
+    # The bridge q model (mlp_q) always expects the 2-tuple (timesteps, x).
+    # When sink supervision is active, ``batch`` is the 3-tuple (t, x, w) —
+    # pass the 2-tuple form explicitly so q's ``timesteps, x = batch``
+    # unpack stays compatible whether or not sink is on.
+    batch_for_q = (timesteps, x)
+
     # sample data
-    samples_q = q(t, batch, keys[0])
+    samples_q = q(t, batch_for_q, keys[0])
     x_t = jax.lax.stop_gradient(samples_q)
     mask = (t >= timesteps[:,:-1,0])*(t <= timesteps[:,1:,0])
     t_mult = config.train.step_size*((1.0 - ((t-timesteps[:,:-1,0])/(timesteps[:,1:,0]-timesteps[:,:-1,0]))**2*mask -\
@@ -640,7 +646,10 @@ def get_loss_hybrid_am_helmholtz(
 
     # Bridge q samples + AM inner-loop refinement (verbatim from
     # get_loss_ours so the AM term's training dynamics match upstream).
-    samples_q = q(t, batch, keys[0])
+    # Re-pack the 2-tuple form mlp_q expects (it does ``timesteps, x = batch``),
+    # since ``batch`` may be a 3-tuple when sink supervision is active.
+    batch_for_q = (timesteps, x)
+    samples_q = q(t, batch_for_q, keys[0])
     x_t = jax.lax.stop_gradient(samples_q)
     mask = (t >= timesteps[:, :-1, 0]) * (t <= timesteps[:, 1:, 0])
     t_mult = config.train.step_size * (
