@@ -142,6 +142,14 @@ def compute_sink_loss(velocity_fn, timesteps, x, weights, sink_weight, rng):
 
   v_obs = jax.vmap(_v_at_marg)(jnp.arange(n_marg))   # (n_marg, B, D)
   norms_sq = (v_obs ** 2).sum(-1)                     # (n_marg, B)
+  # OT-coupling code path threads weights alongside cells through an iterator
+  # that adds a trailing singleton dim (treats per-cell-weight as if it were
+  # a feature vector of size 1), so `weights` arrives as (B, n_marg, 1)
+  # instead of the linear-coupling (B, n_marg). Squeeze the spurious axis so
+  # this function is shape-robust to both iterators.
+  weights = jnp.asarray(weights)
+  if weights.ndim == 3 and weights.shape[-1] == 1:
+    weights = weights.squeeze(-1)
   w = weights.transpose((1, 0))                       # (n_marg, B)
   w_sum = w.sum() + 1e-8
   loss_sink = sink_weight * (w * norms_sq).sum() / w_sum
