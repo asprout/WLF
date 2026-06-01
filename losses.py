@@ -1,4 +1,5 @@
 import math
+import os
 
 import flax
 import jax
@@ -253,7 +254,16 @@ def get_loss_ours(config, model_s, model_q, time_sampler, train):
   # ``get_velocity_fn`` for the dispatch. Helmholtz (curl + lambda_c +
   # lambda_div as a loss term) is NOT supported here — see get_loss().
   sink_weight = float(getattr(config.train, "sink_weight", 0.0))
-  emit_div_diag = True  # cheap; always emit so sweeps can compare runs
+  # Expensive MONITOR-ONLY metrics — the `acceleration` metric (a full
+  # potential-gradient, incl. ∇V over the anchor matrix for phot/ubot+) and the
+  # div(v) diagnostic (a Hessian-vector product via jvp through v=∇s). Both are
+  # computed on EVERY one of n_iters steps but are NEVER read by our eval/
+  # analysis (they only go to wandb, which runs disabled), so they're a pure
+  # per-step tax on every sweep run. OFF by default; set WLF_EMIT_MONITORS=1 to
+  # re-enable when actually inspecting these curves. The trained model is
+  # bit-identical either way (these touch only `metrics`, not `total_loss`,
+  # and consume their own pre-split RNG keys).
+  emit_monitors = os.environ.get("WLF_EMIT_MONITORS", "0") == "1"
 
   def loss_fn(key, params_s, params_q, sampler_state, batch):
     # Optional sink weights at the tail of the batch tuple (3-tuple when
@@ -315,7 +325,14 @@ def get_loss_ours(config, model_s, model_q, time_sampler, train):
     metrics['loss_q'] = loss_q.mean()
     total_loss += loss_q.mean()
 
-    metrics['acceleration'] = jnp.linalg.norm(acceleration_fn(t, samples_q, keys[6]), axis=1).mean()
+    # `acceleration` is a MONITOR-ONLY metric requiring a full gradient of the
+    # potential (∇V over the [B, n_anchor] matrix for phot/ubot+) every step —
+    # the single biggest per-step monitor cost on the on-manifold variants. It
+    # is never read by our eval/analysis (only wandb, disabled), so gate it
+    # behind the same flag as the divergence diagnostic. `potential_var` reuses
+    # the already-computed `potential_value` (no extra eval) so it stays on.
+    if emit_monitors:
+      metrics['acceleration'] = jnp.linalg.norm(acceleration_fn(t, samples_q, keys[6]), axis=1).mean()
     potential_value = jax.lax.stop_gradient(potential_value.squeeze())
     metrics['potential_var'] = ((potential_value.mean() - potential_value)**2).mean()
 
@@ -328,10 +345,10 @@ def get_loss_ours(config, model_s, model_q, time_sampler, train):
     # — committed cells should be at critical points of S, which is what
     # the WLF action interpretation expects of equilibrium states.
     #
-    # DIVERGENCE (monitor only): div(v) = ΔS for v = ∇S. Useful as a
-    # sanity check — strongly negative ΔS at observed cells indicates
-    # attractor cores, positive indicates sources. Always emitted; the
-    # cost is one Hutchinson-trace evaluation per step (cheap).
+    # DIVERGENCE (monitor only, gated by WLF_EMIT_MONITORS): div(v) = ΔS for
+    # v = ∇S. Useful as a sanity check — strongly negative ΔS at observed cells
+    # indicates attractor cores, positive indicates sources. Costs one
+    # Hessian-vector product (jvp through v=∇s) per step, so it's off by default.
     # ------------------------------------------------------------------
     velocity_fn = get_velocity_fn(model_s, params_s, train=train,
                                    loss_name=config.loss)
@@ -340,7 +357,7 @@ def get_loss_ours(config, model_s, model_q, time_sampler, train):
         velocity_fn, timesteps, x, weights, sink_weight, keys[7])
       total_loss = total_loss + loss_sink
       metrics.update(sink_diag)
-    if emit_div_diag:
+    if emit_monitors:
       div_v = compute_div_v_hutchinson(velocity_fn, t, x_t, keys[8])
       metrics['div_v_rms'] = jnp.sqrt(jnp.clip((div_v ** 2).mean(), 1e-12))
       metrics['div_v_mean'] = div_v.mean()  # signed; spots net source/sink
