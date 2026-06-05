@@ -360,6 +360,8 @@ def get_toy_data(config, init_key):
     return get_toy_data_for_ot(config, init_key)
   if config.loss == 'ubot':
     return get_toy_data_for_ubot(config, init_key)
+  if config.loss == 'ubsb':
+    return get_toy_data_for_ubot(config, init_key)
   if config.loss == 'phot':
     return get_toy_data_for_phot(config, init_key)
 

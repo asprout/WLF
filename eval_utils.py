@@ -103,6 +103,11 @@ def get_generator(model, config):
     return ub_generator, ot_generator
   elif config.loss == 'ubot+':
     return ub_generator, ot_generator
+  elif config.loss == 'ubsb':
+    # Unbalanced Schrodinger bridge — upstream (wandb) eval uses the unbalanced
+    # weighted generator; the stochastic SDE rollout for our metrics lives in
+    # tools/wlf_import_worker.py (this path is disabled in our runs).
+    return ub_generator, ot_generator
   return ode_generator, ot_generator
 
 

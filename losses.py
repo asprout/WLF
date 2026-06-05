@@ -199,6 +199,8 @@ def get_loss(config, model_s, model_q, time_sampler, train):
     return get_loss_ours(config, model_s, model_q, time_sampler, train)
   elif config.loss == 'ubot+':
     return get_loss_ours(config, model_s, model_q, time_sampler, train)
+  elif config.loss == 'ubsb':
+    return get_loss_ours(config, model_s, model_q, time_sampler, train)
   elif config.loss == 'rf':
     return get_loss_rf(config, model_s, model_q, time_sampler, train)
   elif config.loss == 'hybrid_am_helm':
@@ -245,6 +247,25 @@ def get_loss_ours(config, model_s, model_q, time_sampler, train):
       dsdtdx_fn = jax.grad(lambda __t, __x, __key: _s(__t, __x, __key).sum(), argnums=[0,1])
       dsdt, dsdx = dsdtdx_fn(_t, _x, _key)
       return dsdt + 0.5*(dsdx**2).sum(1, keepdims=True) + config.lambd*0.5*(_s(_t, _x, _key)**2) + physical_potential(_t, _x)
+  elif config.loss == 'ubsb':
+    # Unbalanced Schrodinger bridge: the HJB residual is the shared kinetic term
+    # PLUS BOTH the sb viscosity term (0.5*sigma^2*Delta s, Hutchinson estimate)
+    # AND the ubot growth term (lambd*0.5*s^2). Upstream ships these as separate
+    # discrete branches and never combined them, but they are orthogonal additive
+    # terms in the same Hamilton-Jacobi residual — so an unbalanced stochastic
+    # bridge is exactly sb's potential + ubot's growth term. Uses config.sigma
+    # (diffusion) AND config.lambd (mass create/destroy) simultaneously.
+    def potential(_t, _x, _key, _s):
+      keys = random.split(_key, 2)
+      dsdt_fn = jax.grad(lambda __t, __x, __key: _s(__t, __x, __key).sum(), argnums=0)
+      dsdx_fn = jax.grad(lambda __t, __x, __key: _s(__t, __x, __key).sum(), argnums=1)
+      eps = random.randint(keys[0], _x.shape, 0, 2).astype(float)*2 - 1.0
+      dsdx_val, jvp_val = jax.jvp(lambda __x: dsdx_fn(_t, __x, keys[1]), (_x,), (eps,))
+      dsdt_val = dsdt_fn(_t, _x, keys[1])
+      out  = dsdt_val + 0.5*(dsdx_val**2).sum(1, keepdims=True)
+      out += 0.5*config.sigma**2*(jvp_val*eps).sum(1, keepdims=True)   # sb viscosity
+      out += config.lambd*0.5*(_s(_t, _x, keys[1]))**2                  # ubot growth
+      return out
   else:
     NotImplementedError(f'potential for config.loss: {config.loss} is not implemented')
 
